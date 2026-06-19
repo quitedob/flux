@@ -1,7 +1,6 @@
 import base64
 import io
 import os
-import sys
 
 import huggingface_hub
 import torch
@@ -42,6 +41,55 @@ def _unpack_fp4_e2m1(uint8_weight: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def _patch_fp8_linears(model: torch.nn.Module) -> None:
+    """Patch nn.Linear layers with FP8 weights to use torch._scaled_mm (true FP8 matmul).
+
+    Keeps weights as FP8 in GPU memory. During forward, quantizes input activations
+    to FP8 and uses _scaled_mm which runs on FP8 Tensor Cores (RTX 40xx+).
+    """
+    for _, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            weight = getattr(module, "weight", None)
+            if weight is not None and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                ws = getattr(module, "weight_scale", None)
+                if ws is None:
+                    continue
+
+                def make_fp8_forward(lin, w_scale):
+                    # Cache the "one" scale tensor — same device as the weight
+                    _one = torch.tensor([[1.0]], device=lin.weight.device, dtype=torch.float32)
+
+                    @torch.no_grad()
+                    def fp8_forward(inp):
+                        # Flatten batch dims for matmul
+                        orig_shape = inp.shape
+                        inp_2d = inp.reshape(-1, orig_shape[-1])  # (M, K)
+
+                        # Per-row quantization: scale per row for better precision
+                        inp_amax = inp_2d.abs().max(dim=-1, keepdim=True)[0].float()
+                        inp_scale = (inp_amax / 240.0).clamp(min=1e-12)  # (M, 1)
+                        inp_fp8 = (inp_2d.float() / inp_scale).clamp(-240, 240).to(torch.float8_e4m3fn)
+
+                        # FP8 matmul via Tensor Cores (scale=1.0, per-row compensation after)
+                        # weight is (out, in) row-major → .t() gives (in, out) col-major
+                        out_2d = torch._scaled_mm(
+                            inp_fp8, lin.weight.t(),
+                            _one, _one,
+                            out_dtype=torch.float32,
+                        )
+                        # Per-row compensation: multiply back the row + column scales
+                        out_2d = out_2d * inp_scale * w_scale.unsqueeze(0)
+                        out_2d = out_2d.to(torch.bfloat16)
+
+                        out = out_2d.reshape(*orig_shape[:-1], -1)
+                        if lin.bias is not None:
+                            out = out + lin.bias
+                        return out
+                    return fp8_forward
+
+                module.forward = make_fp8_forward(module, ws)
+
+
 def load_nvfp4_model(model_name: str, debug_mode: bool = False, device: str | torch.device = "cuda") -> Flux2:
     """Load an NVFP4-quantized FLUX.2 model with on-the-fly dequantization."""
     config = FLUX2_MODEL_INFO[model_name.lower()]
@@ -66,9 +114,10 @@ def load_nvfp4_model(model_name: str, debug_mode: bool = False, device: str | to
                     f"connection and make sure you've access to {config['repo_id']}."
                     "Stopping."
                 )
-                sys.exit(1)
-
-    from safetensors.torch import load_file as load_sft
+                raise RuntimeError(
+                    f"Failed to access the model repository: {config['repo_id']}. "
+                    "Please check your internet connection and make sure you have access."
+                )
 
     if not debug_mode:
         with torch.device("meta"):
@@ -123,6 +172,18 @@ FLUX2_MODEL_INFO = {
         "params": Klein9BParams(),
         "text_encoder_load_fn": lambda device="cuda": load_qwen3_embedder(variant="8B", device=device),
         "model_path": "KLEIN_9B_MODEL_PATH",
+        "defaults": {"guidance": 1.0, "num_steps": 4},
+        "fixed_params": {"guidance", "num_steps"},  # guidance and timestep distilled
+        "guidance_distilled": True,
+    },
+    "flux.2-klein-9b-fp8": {
+        "repo_id": "black-forest-labs/FLUX.2-klein-9b-fp8",
+        "ae_repo_id": "black-forest-labs/FLUX.2-dev",
+        "filename": "flux-2-klein-9b-fp8.safetensors",
+        "filename_ae": "ae.safetensors",
+        "params": Klein9BParams(),
+        "text_encoder_load_fn": lambda device="cuda": load_qwen3_embedder(variant="8B", device=device),
+        "model_path": "KLEIN_9B_FP8_MODEL_PATH",
         "defaults": {"guidance": 1.0, "num_steps": 4},
         "fixed_params": {"guidance", "num_steps"},  # guidance and timestep distilled
         "guidance_distilled": True,
@@ -219,14 +280,50 @@ def load_flow_model(model_name: str, debug_mode: bool = False, device: str | tor
                     f"connection and make sure you've access to {config['repo_id']}."
                     "Stopping."
                 )
-                sys.exit(1)
+                raise RuntimeError(
+                    f"Failed to access the model repository: {config['repo_id']}. "
+                    "Please check your internet connection and make sure you have access."
+                )
 
     if not debug_mode:
         with torch.device("meta"):
-            model = Flux2(FLUX2_MODEL_INFO[model_name.lower()]["params"]).to(torch.bfloat16)
+            model = Flux2(config["params"]).to(torch.bfloat16)
         print(f"Loading {weight_path} for the FLUX.2 weights")
-        sd = load_sft(weight_path, device=str(device))
-        model.load_state_dict(sd, strict=True, assign=True)
+        raw_sd = load_sft(weight_path, device=str(device))
+
+        # Separate FP8 weights and scales from regular params
+        scale_keys = set()
+        fp8_keys = set()
+        for k, v in raw_sd.items():
+            if k.endswith(".input_scale") or k.endswith(".weight_scale"):
+                scale_keys.add(k)
+            elif v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                fp8_keys.add(k)
+
+        if fp8_keys:
+            # FP8 model: keep weights as FP8 in GPU, register scales, patch Linears
+            sd = {k: v for k, v in raw_sd.items() if k not in scale_keys}
+            model.load_state_dict(sd, strict=True, assign=True)
+
+            # Register weight_scale buffers on parent modules for runtime dequantization
+            for fp8_k in fp8_keys:
+                prefix = fp8_k.rsplit(".", 1)[0]
+                ws_key = f"{prefix}.weight_scale"
+                if ws_key in raw_sd:
+                    ws_val = raw_sd[ws_key].float().to(device)
+                    *path, _leaf = fp8_k.split(".")
+                    mod = model
+                    for part in path:
+                        mod = getattr(mod, part)
+                    mod.register_buffer("weight_scale", ws_val, persistent=False)
+
+            # Patch nn.Linear layers to dequantize FP8 weights on-the-fly
+            _patch_fp8_linears(model)
+        else:
+            # BF16 model: just filter scale keys and load
+            sd = {k: v for k, v in raw_sd.items() if k not in scale_keys}
+            model.load_state_dict(sd, strict=True, assign=True)
+
         return model.to(device)
     else:
         with torch.device(device):
@@ -259,7 +356,10 @@ def load_ae(model_name: str, device: str | torch.device = "cuda") -> AutoEncoder
                 f"connection and make sure you've access to {config['repo_id']}."
                 "Stopping."
             )
-            sys.exit(1)
+            raise RuntimeError(
+                f"Failed to access the model repository: {config['repo_id']}. "
+                "Please check your internet connection and make sure you have access."
+            )
 
     if isinstance(device, str):
         device = torch.device(device)

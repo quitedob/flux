@@ -368,12 +368,13 @@ class Qwen3Embedder(nn.Module):
         self,
         model_spec: str,
         device: str | torch.device = "cuda",
+        torch_dtype: torch.dtype | None = None,
     ):
         super().__init__()
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_spec,
-            torch_dtype=None,
+            torch_dtype=torch_dtype,
             device_map=str(device),
             local_files_only=True,
         )
@@ -441,4 +442,8 @@ def load_qwen3_embedder(variant: str, device: str | torch.device = "cuda"):
         model_spec = str(local_path)
     else:
         model_spec = f"Qwen/Qwen3-{variant}-FP8"
-    return Qwen3Embedder(model_spec=model_spec, device=device)
+
+    # 4B variant has no FP8 quantization_config → load in bfloat16
+    # 8B variant has proper FP8 quantizer → use native dtype (FP8 storage)
+    load_dtype = torch.bfloat16 if variant == "4B" else None
+    return Qwen3Embedder(model_spec=model_spec, device=device, torch_dtype=load_dtype)
