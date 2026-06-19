@@ -231,5 +231,17 @@ $RECYCLE.BIN/
 
 output/
 outputs/
-models/
 .claude/
+.pip-cache/
+
+# Model weight files (too large for git)
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.gguf
+# Allow model configs/tokenizers but not cached model files
+models/.cache/
+models/*/.msc
+models/*/.mdl
